@@ -25,7 +25,7 @@ from config import (
     REANALYZE_EVERY
 )
 from utils.preprocessing import smooth_mask
-from utils.skeleton      import prune_spurs, extract_graph_segments
+from utils.skeleton      import prune_spurs, extract_graph_segments, skeleton_degree
 from idss.features       import extract_idss_features
 from idss.rules          import apply_knowledge_rules
 from idss.ahp            import compute_ahp_weights
@@ -51,9 +51,11 @@ def analyze_frame(prob_np, gray_np):
     skeleton = skeletonize(mask_sm > 0).astype(np.uint8)
     skeleton = prune_spurs(skeleton, iters=SPUR_PRUNE_ITERS)
     segments = extract_graph_segments(skeleton, min_len_px=MIN_SEGMENT_LEN)
+    deg = skeleton_degree(skeleton)
+    junctions = np.column_stack(np.where((skeleton > 0) & (deg >= 3)))
 
     if len(segments) == 0:
-        return None, None, None, None, None
+        return None, None, None, None
 
     features          = extract_idss_features(
         segments, skeleton, dist_map, prob_np, (IMAGE_H, IMAGE_W)
@@ -85,70 +87,51 @@ def analyze_frame(prob_np, gray_np):
     best_score      = final_scores[best_idx]
     insertion_point = find_insertion_point(best_feat["path"], dist_map)
 
-    return best_feat, insertion_point, best_score, mask_sm, segments
+    return best_feat, insertion_point, segments, junctions
 
 
 # ── Draw results on frame ─────────────────────────────────────────
-def draw_on_frame(frame, best_feat, insertion_point,
-                  best_score, mask_sm, frame_num, fps):
-    H, W   = frame.shape[:2]
+def draw_ui_overlay(frame, segments, best_feat, insertion_point, junctions):
+    H, W = frame.shape[:2]
     output = frame.copy()
 
-    # Blue vein overlay
-    if mask_sm is not None:
-        # Resize mask to match frame size
-        mask_resized = cv2.resize(mask_sm, (W, H),
-                                  interpolation=cv2.INTER_NEAREST)
-        blue_overlay = np.zeros_like(output)
-        blue_overlay[mask_resized > 0] = [255, 100, 0]
-        output = cv2.addWeighted(output, 0.8, blue_overlay, 0.2, 0)
+    scale_y = H / IMAGE_H
+    scale_x = W / IMAGE_W
 
-    # Best segment in green
+    # 1. All veins (Green)
+    if segments is not None:
+        for path in segments:
+            pts = np.array([[int(x * scale_x), int(y * scale_y)] for y, x in path], np.int32)
+            cv2.polylines(output, [pts], isClosed=False, color=(0, 255, 0), thickness=2)
+
+    # 2. Best segment (Yellow)
     if best_feat is not None:
-        # Scale coordinates from model size to frame size
-        scale_y = H / IMAGE_H
-        scale_x = W / IMAGE_W
-        for (y, x) in best_feat["path"]:
+        best_pts = np.array([[int(x * scale_x), int(y * scale_y)] for y, x in best_feat["path"]], np.int32)
+        cv2.polylines(output, [best_pts], isClosed=False, color=(0, 255, 255), thickness=3)
+
+        # 3. Confidence Text
+        if insertion_point is not None:
+            iy = int(insertion_point[0] * scale_y)
+            ix = int(insertion_point[1] * scale_x)
+
+            cv2.circle(output, (ix, iy), 5, (0, 255, 255), -1)
+            conf_pct = best_feat["confidence"] * 100
+            text_x = ix + 30
+            text_y = iy - 20
+            
+            cv2.line(output, (ix, iy), (text_x, text_y), (0, 255, 255), 1)
+            cv2.putText(output, "Best Segment", (text_x, text_y - 5), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(output, f"conf. {conf_pct:.1f}%", (text_x, text_y + 15), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+    # 4. Avoid markers (Red)
+    if junctions is not None:
+        for (y, x) in junctions:
             fy = int(y * scale_y)
             fx = int(x * scale_x)
-            cv2.circle(output, (fx, fy), 3, (0, 255, 0), -1)
-
-    # Insertion point
-    if insertion_point is not None:
-        scale_y = H / IMAGE_H
-        scale_x = W / IMAGE_W
-        iy = int(insertion_point[0] * scale_y)
-        ix = int(insertion_point[1] * scale_x)
-
-        cv2.circle(output, (ix, iy), 18, (0, 255, 255), 2)
-        cv2.circle(output, (ix, iy), 5,  (0, 0, 255),   -1)
-        cv2.arrowedLine(output,
-                        (ix + 45, iy - 45),
-                        (ix + 19, iy - 19),
-                        (0, 255, 255), 2, tipLength=0.35)
-        cv2.putText(output, "INSERT HERE",
-                    (ix + 48, iy - 48),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (0, 255, 255), 2, cv2.LINE_AA)
-
-    # Safety score
-    if best_score is not None:
-        score_pct   = best_score * 100
-        score_text  = f"Safety: {score_pct:.1f}%"
-        score_color = (
-            (0, 255, 0)      if score_pct >= 75
-            else (0, 165, 255) if score_pct >= 50
-            else (0, 0, 255)
-        )
-        cv2.putText(output, score_text,
-                    (15, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0, score_color, 2, cv2.LINE_AA)
-
-    # Frame counter and FPS
-    cv2.putText(output, f"Frame: {frame_num}  FPS: {fps:.1f}",
-                (15, H - 15),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, (180, 180, 180), 1, cv2.LINE_AA)
+            cv2.line(output, (fx-5, fy-5), (fx+5, fy+5), (0, 0, 255), 2)
+            cv2.line(output, (fx+5, fy-5), (fx-5, fy+5), (0, 0, 255), 2)
 
     return output
 
@@ -236,14 +219,10 @@ def process_video(video_path, save_path=None, skip=1):
 
         # Run IDSS every N frames
         if processed % REANALYZE_EVERY == 0:
-            best_feat, insertion_point, best_score, mask_sm, _ = \
-                analyze_frame(prob_np, gray_r)
+            best_feat, insertion_point, segments, junctions = analyze_frame(prob_np, gray_r)
 
         # Draw results on original size frame
-        output = draw_on_frame(
-            frame, best_feat, insertion_point,
-            best_score, mask_sm, frame_num, fps
-        )
+        output = draw_ui_overlay(frame, segments, best_feat, insertion_point, junctions)
 
         # Show
         cv2.imshow("IDSS - Video Analysis", output)
