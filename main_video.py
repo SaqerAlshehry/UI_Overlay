@@ -72,7 +72,7 @@ def analyze_frame(prob_np, gray_np):
             rule_results.append({"penalty": penalty, "bonus": bonus})
 
     if len(accepted_features) == 0:
-        return None, None, None, None, None
+        return None, None, segments, junctions
 
     weights, _   = compute_ahp_weights(verbose=False)
     normalized   = normalize_features(accepted_features)
@@ -182,6 +182,8 @@ def process_video(video_path, save_path=None, skip=1):
     # State - reuse last IDSS result between frames
     best_feat       = None
     insertion_point = None
+    segments        = None
+    junctions       = None
     best_score      = None
     mask_sm         = None
     frame_num       = 0
