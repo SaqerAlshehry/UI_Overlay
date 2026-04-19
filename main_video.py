@@ -11,6 +11,7 @@
 #   python main_video.py --video myvideo.mp4 --skip 5
 # ================================================================
 
+from utils.calibration import CoinCalibrator
 import os
 import time
 import argparse
@@ -21,8 +22,9 @@ from skimage.morphology import skeletonize
 
 from config import (
     MODEL_PATH, IMAGE_H, IMAGE_W,
-    THRESHOLD, MIN_SEGMENT_LEN, SPUR_PRUNE_ITERS,
-    REANALYZE_EVERY
+    THRESHOLD, SPUR_PRUNE_ITERS, REANALYZE_EVERY,
+    MIN_LENGTH_MM, MIN_DIAMETER_MM, MIN_BRANCH_DIST_MM,
+    MIN_USABLE_LENGTH_MM, MIN_ENDPOINT_BRANCH_DIST_MM
 )
 from utils.preprocessing import smooth_mask
 from utils.skeleton      import prune_spurs, extract_graph_segments, skeleton_degree
@@ -43,14 +45,32 @@ def load_model():
 
 
 # ── Run IDSS on one frame ─────────────────────────────────────────
-def analyze_frame(prob_np, gray_np):
+def analyze_frame(prob_np, gray_np, current_scale):
     img_np   = gray_np.astype(np.float32) / 255.0
     mask_raw = (prob_np > THRESHOLD).astype(np.uint8)
     mask_sm  = smooth_mask(mask_raw)
     dist_map = cv2.distanceTransform(mask_sm, cv2.DIST_L2, 5)
     skeleton = skeletonize(mask_sm > 0).astype(np.uint8)
     skeleton = prune_spurs(skeleton, iters=SPUR_PRUNE_ITERS)
-    segments = extract_graph_segments(skeleton, min_len_px=MIN_SEGMENT_LEN)
+
+
+
+    if current_scale is not None:
+        dynamic_min_len_px         = int(MIN_LENGTH_MM / current_scale)
+        dynamic_min_diam_px        = int(MIN_DIAMETER_MM / current_scale)
+        dynamic_min_branch_px      = int(MIN_BRANCH_DIST_MM / current_scale)
+        dynamic_min_usable_px      = int(MIN_USABLE_LENGTH_MM / current_scale)
+        dynamic_endpoint_branch_px = int(MIN_ENDPOINT_BRANCH_DIST_MM / current_scale)
+    else:
+
+        dynamic_min_len_px         = 30
+        dynamic_min_diam_px        = 4
+        dynamic_min_branch_px      = 15
+        dynamic_min_usable_px      = 25
+        dynamic_endpoint_branch_px = 15
+
+
+    segments = extract_graph_segments(skeleton, min_len_px=dynamic_min_len_px)
     deg = skeleton_degree(skeleton)
     junctions = np.column_stack(np.where((skeleton > 0) & (deg >= 3)))
 
@@ -65,7 +85,15 @@ def analyze_frame(prob_np, gray_np):
     rule_results      = []
 
     for i, feat in enumerate(features):
+
         acc, penalty, bonus, _ = apply_knowledge_rules(feat)
+        
+
+        if feat["diameter"] < dynamic_min_diam_px:
+            acc = False
+        if feat["branch_dist"] < dynamic_min_branch_px:
+            acc = False
+
         if acc:
             accepted_features.append(feat)
             accepted_indices.append(i)
@@ -86,6 +114,9 @@ def analyze_frame(prob_np, gray_np):
     best_feat       = accepted_features[best_idx]
     best_score      = final_scores[best_idx]
     insertion_point = find_insertion_point(best_feat["path"], dist_map)
+    
+
+    best_feat["confidence"] = best_score 
 
     return best_feat, insertion_point, segments, junctions
 
@@ -153,7 +184,6 @@ def process_video(video_path, save_path=None, skip=1):
 
     model = load_model()
 
-    # Open video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
@@ -170,7 +200,6 @@ def process_video(video_path, save_path=None, skip=1):
     print(f"  Total frames: {total_frames}")
     print(f"  Processing every {skip} frame(s)")
 
-    # Setup output writer
     writer = None
     if save_path:
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
@@ -179,13 +208,12 @@ def process_video(video_path, save_path=None, skip=1):
                                  (orig_w, orig_h))
         print(f"  Saving to: {save_path}")
 
-    # State - reuse last IDSS result between frames
     best_feat       = None
     insertion_point = None
     segments        = None
     junctions       = None
-    best_score      = None
-    mask_sm         = None
+    calibrator      = CoinCalibrator() 
+    current_scale   = None             
     frame_num       = 0
     processed       = 0
 
@@ -202,50 +230,55 @@ def process_video(video_path, save_path=None, skip=1):
 
         frame_num += 1
 
-        # Skip frames if requested
+
         if frame_num % skip != 0:
             continue
 
         processed += 1
 
-        # Convert to grayscale and resize for model
-        gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+
+        current_scale, found_circles = calibrator.update(gray)
+
+
         gray_r  = cv2.resize(gray, (IMAGE_W, IMAGE_H), interpolation=cv2.INTER_AREA)
         img_f   = gray_r.astype(np.float32) / 255.0
         tensor  = torch.from_numpy(img_f).unsqueeze(0).unsqueeze(0)
 
-        # Run model
+
         with torch.no_grad():
             out     = model(tensor)
             prob_np = torch.sigmoid(out[0, 0]).numpy()
 
-        # Run IDSS every N frames
-        if processed % REANALYZE_EVERY == 0:
-            best_feat, insertion_point, segments, junctions = analyze_frame(prob_np, gray_r)
 
-        # Draw results on original size frame
+        if processed % REANALYZE_EVERY == 0:
+
+            best_feat, insertion_point, segments, junctions = analyze_frame(prob_np, gray_r, current_scale)
+
         output = draw_ui_overlay(frame, segments, best_feat, insertion_point, junctions)
 
-        # Show
+
         cv2.imshow("IDSS - Video Analysis", output)
 
-        # Save
+
         if writer:
             writer.write(output)
 
-        # FPS
+
         elapsed = time.time() - fps_timer
         if elapsed >= 1.0:
             fps       = processed / elapsed
             processed = 0
             fps_timer = time.time()
 
-        # Progress
+
         if frame_num % 30 == 0:
             pct = (frame_num / total_frames) * 100
             print(f"  Progress: {frame_num}/{total_frames} ({pct:.1f}%)  FPS: {fps:.1f}")
 
-        # Key press
+
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             print("Stopped early by user.")
