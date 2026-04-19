@@ -89,9 +89,9 @@ def analyze_frame(prob_np, gray_np, current_scale):
         acc, penalty, bonus, _ = apply_knowledge_rules(feat)
         
 
-        if feat["diameter"] < dynamic_min_diam_px:
+        if feat["diameter_px"] < dynamic_min_diam_px:
             acc = False
-        if feat["branch_dist"] < dynamic_min_branch_px:
+        if feat["branch_distance"] < dynamic_min_branch_px:
             acc = False
 
         if acc:
